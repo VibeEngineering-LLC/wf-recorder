@@ -1,0 +1,13 @@
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# записи рекордера (артефакты работы)
+*.aswf
+temps.csv
