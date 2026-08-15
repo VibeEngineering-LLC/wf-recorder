@@ -372,7 +372,7 @@ def fetch_one_filemode(host, out_dir, seg, token):
     if have != want:
         try:
             blob = http_get(host + "/api/waterfall/segment?name=" + name, binary=True)
-        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
             return f"error:get:{e}"
         if len(blob) != want:
             return "sizemismatch"                 # не удаляем на плате — заберём позже
@@ -386,7 +386,7 @@ def fetch_one_filemode(host, out_dir, seg, token):
     # приём подтверждён (файл на диске == листинг) -> плата освобождает Flash
     try:
         ok = ack_delete(host, name, token)
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
         return f"error:del:{e}"
     return "ok" if ok else "error:del-status"
 
@@ -406,7 +406,7 @@ def fetch_one_stitch(host, stitcher, seg, token):
     if not stitcher.already_ingested(name, want):
         try:
             blob = http_get(host + "/api/waterfall/segment?name=" + name, binary=True)
-        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
             return f"error:get:{e}", 0, None, None
         if len(blob) != want:
             return "sizemismatch", 0, None, None   # не удаляем — заберём в след. проходе
@@ -419,7 +419,7 @@ def fetch_one_stitch(host, stitcher, seg, token):
 
     try:
         ok = ack_delete(host, name, token)
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
         return f"error:del:{e}", rows, gap, diag
     return ("ok" if ok else "error:del-status"), rows, gap, diag
 
@@ -519,7 +519,7 @@ def main():
     while True:
         try:
             one_pass(host, out_dir, stitcher)
-        except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError) as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError, TimeoutError) as e:
             print(f"проход не удался: {e}")
         if args.once:
             break
