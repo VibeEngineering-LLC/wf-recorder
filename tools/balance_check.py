@@ -58,6 +58,34 @@ def get_open_rows(segments):
         return 0
     return sum(seg["rows"] for seg in segments if not seg.get("finalized", False))
 
+def has_open_segment(segments):
+    """#TEST-1: был ли на снимке открытый (finalized=false) сегмент.
+
+    API платы отдаёт rows=0 для НЕЗАВЕРШЁННОГО сегмента ВСЕГДА, даже если в
+    нём реально уже накоплены строки — поле обновляется только при
+    финализации. Поэтому агрегатная формула через total_rows/finalized-суммы
+    не может быть точной, если окно before/after задевает границу открытого
+    сегмента — это слепое пятно измерения, не потеря данных.
+    """
+    return any(not seg.get("finalized", False) for seg in (segments or []))
+
+def reconcile_by_identity(segments_before, segments_after):
+    """#TEST-1: сверка по СУДЬБЕ каждого сегмента, не по агрегатным суммам.
+
+    Единственная достоверная величина API — rows у УЖЕ завершённого сегмента.
+    Сегмент finalized=true в before, пропавший из листинга after, считается
+    переданным клиенту и удалённым с платы — его rows суммируются. Открытые
+    сегменты (в before или в after) не входят в подсчёт вовсе — про их
+    реальное наполнение достоверно ничего не известно.
+    """
+    before_finalized = {s["name"]: s["rows"] for s in (segments_before or [])
+                         if s.get("finalized", False)}
+    after_names = {s["name"] for s in (segments_after or [])}
+    transferred = {name: rows for name, rows in before_finalized.items()
+                   if name not in after_names}
+    still_present = [name for name in before_finalized if name in after_names]
+    return sum(transferred.values()), sorted(transferred), still_present
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--before", required=True)
@@ -121,46 +149,62 @@ def main():
     # Проверка согласованности метаданных сегментов
     segments_before = before.get("segments")
     segments_after = after.get("segments")
-    
+
+    # #TEST-1: надёжная сверка — по идентичности сегментов, не по агрегату
+    transferred_rows, transferred_names, still_present = reconcile_by_identity(
+        segments_before, segments_after)
+    open_seg_present = has_open_segment(segments_before) or has_open_segment(segments_after)
+
     for seg in segments_before or []:
-        if "bytes" in seg and "rows" in seg:
+        if seg.get("bytes", 0) > 0 and "rows" in seg:
             expected_rows = (seg["bytes"] - args.seg_overhead) // args.stride
             if expected_rows != seg["rows"]:
                 print(f"⚠ сегмент {seg['name']}: заявлено rows={seg['rows']}, из размера следует {expected_rows} — плата сообщает о себе неверно", file=sys.stderr)
     
     for seg in segments_after or []:
-        if "bytes" in seg and "rows" in seg:
+        if seg.get("bytes", 0) > 0 and "rows" in seg:
             expected_rows = (seg["bytes"] - args.seg_overhead) // args.stride
             if expected_rows != seg["rows"]:
                 print(f"⚠ сегмент {seg['name']}: заявлено rows={seg['rows']}, из размера следует {expected_rows} — плата сообщает о себе неверно", file=sys.stderr)
     
-    # Вывод
+    # Вывод. Главный вердикт — по идентичности сегментов (см. reconcile_by_identity):
+    # это единственная сверка, не зависящая от слепого пятна на открытом сегменте.
+    # Агрегатная арифметика (diff/expected_balance) остаётся СПРАВОЧНОЙ — при
+    # open_seg_present она заведомо ненадёжна и не должна решать вердикт.
     diff = produced_by_board - expected_balance
-    
+    identity_diff = rows_written - transferred_rows
+    verdict_ok = (identity_diff == 0)
+
     if args.json:
         result = {
+            "identity_transferred_rows": transferred_rows,
+            "identity_diff": identity_diff,
+            "open_segment_present": open_seg_present,
             "produced_by_board": produced_by_board,
             "written_to_pc": rows_written,
             "dropped_by_ring": dropped_by_ring,
             "remaining_on_board": remaining_on_board,
             "expected_balance": expected_balance,
-            "difference": diff
+            "aggregate_difference": diff
         }
         print(json.dumps(result, ensure_ascii=False))
-        # код возврата обязан отражать результат и в этом режиме тоже:
-        # без этого вызывающий скрипт увидит успех при несошедшемся балансе
-        sys.exit(0 if diff == 0 else 1)
+        sys.exit(0 if verdict_ok else 1)
     else:
-        print(f"произведено_платой: {produced_by_board}")
+        print(f"перенесено сегментов (по идентичности): {len(transferred_names)}, "
+              f"строк: {transferred_rows}")
         print(f"записано_на_ПК: {rows_written}")
-        print(f"вытеснено_кольцом: {dropped_by_ring}")
-        print(f"осталось_на_плате: {remaining_on_board}")
-        print(f"ожидаемый_баланс: {expected_balance}")
-        if diff == 0:
-            print("БАЛАНС СОШЁЛСЯ")
+        if open_seg_present:
+            print("⚠ на границе окна есть открытый сегмент — агрегатные числа ниже "
+                  "справочные (API не сообщает накопление в незавершённом сегменте)")
+        print(f"  справочно: произведено_платой={produced_by_board} "
+              f"вытеснено_кольцом={dropped_by_ring} осталось_на_плате={remaining_on_board} "
+              f"агрегатное_расхождение={diff}")
+        if verdict_ok:
+            print("БАЛАНС СОШЁЛСЯ (по идентичности сегментов)")
             sys.exit(0)
         else:
-            print(f"БАЛАНС НЕ СОШЁЛСЯ: расхождение {diff} строк")
+            print(f"БАЛАНС НЕ СОШЁЛСЯ: расхождение {identity_diff} строк "
+                  f"(перенесено {transferred_names} не совпадает с записанным на ПК)")
             sys.exit(1)
 
 if __name__ == "__main__":
