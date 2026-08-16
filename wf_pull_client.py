@@ -21,8 +21,17 @@ firewall. Плата ничего не инициирует; ПК сам опр�
 
 Единый файл: шапка = шапка ПЕРВОГО сегмента (saved_rows=0 -> строки считаются из
 размера файла, конвенция #FW-14), payload = конкатенация строк всех сегментов.
-Абсолютных таймстампов у строк нет (формат v2) — пауза платы между сегментами
-детектируется по started_at и печатается предупреждением, но в файл не попадает.
+Пауза платы между сегментами детектируется по started_at шапки и печатается
+предупреждением, но в файл не попадает. (В формате v5 у строк ЕСТЬ абсолютный
+timestamp uint32, offset 16386 — клиент его пока не читает; прежняя редакция этого
+абзаца утверждала, что таймстампов нет вовсе, что верно только для v2.)
+
+Идемпотентность (#DATA-7): сегмент опознаётся по отпечатку СОДЕРЖИМОГО, а не по
+имени. Имя seg_NNNNN уникально лишь в пределах текущего наполнения каталога платы —
+номер восстанавливается сканом каталога при старте, поэтому после ребута на
+опустевшем каталоге имена идут заново. Клиент качает сегмент всегда и удаляет его
+на плате только после того, как строки записаны на диск или отпечаток совпал с уже
+вшитым.
 
 Температура: у платы нет per-row температуры (прибор отдаёт T1/T2/T3 ответом на
 -inf раз в 30 мин, #FW-13). Клиент логирует её рядом: <stitch>.temps.csv
@@ -38,6 +47,7 @@ VPN-прокси, который может отдавать 503 на прямы
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import struct
@@ -164,8 +174,11 @@ def verify_rows(whole, stride, n_rows, hdr, name):
 class Stitcher:
     """Единый .aswf + state.json (идемпотентность и учёт времени).
 
-    state: {"ingested": {name: bytes}, "rows": N, "dur_sum": сек,
-            "started_at": unix первого сегмента}
+    state: {"ingested": {name: {"b": bytes, "d": sha256[:32]}}, "rows": N,
+            "dur_sum": сек, "started_at": unix первого сегмента}
+
+    #DATA-7: до этой версии значением было голое число байт. Такие записи читаются
+    (совместимость), но подтверждением не считаются — отпечатка в них нет.
     """
 
     def __init__(self, path):
@@ -219,8 +232,24 @@ class Stitcher:
             os.fsync(f.fileno())
         os.replace(tmp, self.state_path)
 
-    def already_ingested(self, name, want_bytes):
-        return self.state["ingested"].get(name) == want_bytes
+    def _trim_ingested(self):
+        """#DATA-7: расписки живут не вечно. Назначение записи — пережить падение
+        между fsync и ack, то есть секунды; дальше сегмента на плате уже нет.
+        Бессрочное накопление превращает каждую запись в мину под будущую
+        перенумерацию имён (у пострадавшего их набралось ~360). Держим последние
+        INGEST_KEEP — с запасом на самый долгий проход."""
+        ing = self.state.get("ingested")
+        if not isinstance(ing, dict) or len(ing) <= INGEST_KEEP:
+            return
+        for name in list(ing)[:len(ing) - INGEST_KEEP]:   # dict хранит порядок вставки
+            del ing[name]
+
+    def ingest_confirmed(self, name, digest):
+        """Настоящий ли это дубль: совпал отпечаток содержимого. Для записей
+        старого формата (только размер) отпечатка нет — считаем НЕ подтверждённым
+        и вшиваем. Ложная дозапись строк восстановима, стирание на плате — нет."""
+        rec = self.state["ingested"].get(name)
+        return isinstance(rec, dict) and rec.get("d") == digest
 
     def append_segment(self, name, blob):
         """Дозаписать строки сегмента в единый файл.
@@ -272,7 +301,7 @@ class Stitcher:
             _, fstride, fch = self._file_header()
             if fch != ch or fstride != stride:
                 self._rotate_for_format(ch, stride, fch, fstride)
-                if self.already_ingested(name, len(blob)):
+                if self.ingest_confirmed(name, seg_digest(blob)):
                     # уже вшит в новый файл (рестарт после ротации, ack платы не
                     # прошёл) — строки не дублируем, снаружи останется только ack
                     return 0, None, None
@@ -305,7 +334,8 @@ class Stitcher:
                 f.flush()
                 os.fsync(f.fileno())
 
-        self.state["ingested"][name] = len(blob)
+        self.state["ingested"][name] = {"b": len(blob), "d": seg_digest(blob)}
+        self._trim_ingested()
         self.state["rows"] = self.state.get("rows", 0) + n_rows
         self.state["dur_sum"] = self.state.get("dur_sum", 0) + dur
         if hdr.get("started_at"):
@@ -354,6 +384,34 @@ class Stitcher:
 
 # ---------------------------------------------------------------- проходы
 
+INGEST_KEEP = 256   # #DATA-7: сколько последних расписок держать в state.json
+
+
+def seg_digest(blob):
+    """#DATA-7: отпечаток содержимого сегмента — единственный надёжный ключ
+    идемпотентности. Имя (seg_NNNNN) уникально лишь в пределах текущего наполнения
+    каталога платы: номер восстанавливается сканом каталога при старте, поэтому
+    после ребута на опустевшем каталоге имена начинаются заново. Размер тоже не
+    различает — при фиксированном interval_sec он у всех полных сегментов один."""
+    return hashlib.sha256(blob).hexdigest()[:32]
+
+
+def _spare_collision(dst, blob, name):
+    """#DATA-7: не затирать уже забранный файл его ТЁЗКОЙ с другим содержимым.
+    Совпадение имени больше ничего не гарантирует, поэтому при расхождении
+    отпечатка новый сегмент кладётся рядом под уникальным именем, а не поверх."""
+    if not os.path.exists(dst):
+        return dst
+    with open(dst, "rb") as f:
+        if seg_digest(f.read()) == seg_digest(blob):
+            return dst                     # тот же самый сегмент, перезапись безвредна
+    root, ext = os.path.splitext(dst)
+    dst = f"{root}__{seg_digest(blob)[:8]}{ext}"
+    print(f"  ⚠ {name}: на диске тёзка с другим содержимым (плата перенумеровала "
+          f"сегменты) -> сохраняю как {os.path.basename(dst)}")
+    return dst
+
+
 def ack_delete(host, name, token):
     st, _ = http_post(host + "/api/waterfall/segment/delete?name=" + name,
                       headers={"X-CSRF-Token": token})
@@ -367,21 +425,25 @@ def fetch_one_filemode(host, out_dir, seg, token):
     want = int(seg["bytes"])
     dst = os.path.join(out_dir, name)
 
-    # идемпотентность: если файл уже забран целиком, повторно не качаем, но ack шлём
-    have = os.path.getsize(dst) if os.path.exists(dst) else -1
-    if have != want:
-        try:
-            blob = http_get(host + "/api/waterfall/segment?name=" + name, binary=True)
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-            return f"error:get:{e}"
-        if len(blob) != want:
-            return "sizemismatch"                 # не удаляем на плате — заберём позже
-        tmp = dst + ".part"
-        with open(tmp, "wb") as f:
-            f.write(blob)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, dst)                      # атомарная публикация
+    # #DATA-7: качаем ВСЕГДА, как и в режиме шва. Прежде скачивание пропускалось,
+    # если на диске лежал файл того же имени и размера — но имена переиспользуются
+    # после ребута платы на пустом каталоге, а размер при постоянном interval_sec
+    # одинаков у всех. Совпадал ТЁЗКА: ack ниже стирал новые данные на плате, на
+    # диске оставался старый файл, и никто ничего не замечал.
+    try:
+        blob = http_get(host + "/api/waterfall/segment?name=" + name, binary=True)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        return f"error:get:{e}"
+    if len(blob) != want:
+        return "sizemismatch"                     # не удаляем на плате — заберём позже
+
+    dst = _spare_collision(dst, blob, name)
+    tmp = dst + ".part"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dst)                          # атомарная публикация
 
     # приём подтверждён (файл на диске == листинг) -> плата освобождает Flash
     try:
@@ -403,19 +465,25 @@ def fetch_one_stitch(host, stitcher, seg, token):
     name = seg["name"]
     want = int(seg["bytes"])
 
-    if not stitcher.already_ingested(name, want):
-        try:
-            blob = http_get(host + "/api/waterfall/segment?name=" + name, binary=True)
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
-            return f"error:get:{e}", 0, None, None
-        if len(blob) != want:
-            return "sizemismatch", 0, None, None   # не удаляем — заберём в след. проходе
+    # #DATA-7: качаем ВСЕГДА. Прежде скачивание пропускалось при совпадении
+    # (имя, размер) — и тогда ack ниже стирал на плате сегмент, содержимого которого
+    # клиент даже не видел. Так пропали 66 сегментов: после ребута платы на пустом
+    # каталоге имена пошли заново, а при постоянном interval_sec совпал и размер.
+    # Экономия была только на редких повторах, цена — потеря данных.
+    try:
+        blob = http_get(host + "/api/waterfall/segment?name=" + name, binary=True)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+        return f"error:get:{e}", 0, None, None
+    if len(blob) != want:
+        return "sizemismatch", 0, None, None   # не удаляем — заберём в след. проходе
+
+    if stitcher.ingest_confirmed(name, seg_digest(blob)):
+        rows, gap, diag = 0, None, None       # тот же самый сегмент: строки уже в шве
+    else:
         try:
             rows, gap, diag = stitcher.append_segment(name, blob)
         except (ValueError, OSError) as e:
             return f"error:stitch:{e}", 0, None, None
-    else:
-        rows, gap, diag = 0, None, None           # уже вшит; остался только ack
 
     try:
         ok = ack_delete(host, name, token)
@@ -432,7 +500,7 @@ def one_pass(host, out_dir, stitcher):
             print(f"  T: t1={t[0]} t2={t[1]} t3={t[2]} -> {os.path.basename(stitcher.temps_path)}")
     segs = list_segments(host)
     pending = sorted([s for s in segs if s.get("finalized")], key=lambda s: int(s["idx"]))
-    got = skipped = failed = rows_total = 0
+    got = skipped = failed = rows_total = dup_ack = 0
     for seg in pending:
         if stitcher:
             r, rows, gap, diag = fetch_one_stitch(host, stitcher, seg, token)
@@ -442,6 +510,8 @@ def one_pass(host, out_dir, stitcher):
         if r == "ok":
             got += 1
             rows_total += rows
+            if stitcher and not rows:
+                dup_ack += 1          # #DATA-7: отпечаток сошёлся с уже вшитым
             extra = f" +{rows} строк" if rows else " (уже вшит, только ack)"
             print(f"  ✓ {seg['name']}  {seg['bytes']} B{extra}  стёрт на плате")
             if gap is not None:
@@ -481,6 +551,13 @@ def one_pass(host, out_dir, stitcher):
     if stitcher:
         tail = (f", файл шва: {stitcher.state.get('rows', 0)} строк / "
                 f"{stitcher.state.get('dur_sum', 0)} с")
+    # #DATA-7: проход, где плата отдала сегменты, а в шов не легло ни строки, —
+    # аномалия. Именно так выглядела молчаливая потеря 66 сегментов: строка итога
+    # печатала «+0 строк, ошибок 0», и это читалось как успех.
+    if dup_ack and not rows_total:
+        print(f"  ⚠ ВНИМАНИЕ: {dup_ack} сегм. подтверждено по отпечатку и стёрто на "
+              f"плате, в шов добавлено 0 строк. Это нормально только если вы "
+              f"перезапустили забор уже забранных данных.")
     print(f"проход: забрано {got} (+{rows_total} строк), отложено {skipped}, "
           f"ошибок {failed}, открытых (пропущены) {open_cnt}{tail}")
     return got, failed
