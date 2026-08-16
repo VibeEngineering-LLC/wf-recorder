@@ -47,6 +47,9 @@ def test_fetch_one_filemode_survives_delete_timeout(monkeypatch, tmp_path):
     def mock_ack_delete(*args, **kwargs):
         raise TimeoutError("board rebooted before responding to delete")
 
+    # #DATA-7: скачивание больше не пропускается по совпадению (имя, размер),
+    # поэтому до ack_delete тест доходит только с рабочим http_get
+    monkeypatch.setattr(wpc, "http_get", lambda *a, **k: b"data")
     monkeypatch.setattr(wpc, "ack_delete", mock_ack_delete)
     result = wpc.fetch_one_filemode("http://board", str(tmp_path), seg, "tok")
     assert result.startswith("error:del:"), f"Ожидался статус с 'error:del:', но получено: {result}"
@@ -55,14 +58,15 @@ def test_fetch_one_filemode_survives_delete_timeout(monkeypatch, tmp_path):
 def test_fetch_one_stitch_survives_delete_timeout(monkeypatch):
     """Проверяет, что fetch_one_stitch выживает при TimeoutError в ack_delete."""
     class FakeStitcher:
-        def already_ingested(self, name, want):
-            return True
+        def ingest_confirmed(self, name, digest):
+            return True          # #DATA-7: подтверждённый дубль — строки уже в шве
 
     seg = {"name": "seg_0002.aswf", "bytes": 4}
 
     def mock_ack_delete(*args, **kwargs):
         raise TimeoutError("board rebooted before responding to delete")
 
+    monkeypatch.setattr(wpc, "http_get", lambda *a, **k: b"data")
     monkeypatch.setattr(wpc, "ack_delete", mock_ack_delete)
     status, rows, gap, diag = wpc.fetch_one_stitch("http://board", FakeStitcher(), seg, "tok")
     assert status.startswith("error:del:"), f"Ожидался статус с 'error:del:', но получено: {status}"
@@ -83,7 +87,7 @@ def test_fetch_one_filemode_survives_get_timeout(monkeypatch, tmp_path):
 def test_fetch_one_stitch_survives_get_timeout(monkeypatch):
     """Проверяет, что fetch_one_stitch выживает при TimeoutError в http_get."""
     class FakeStitcher:
-        def already_ingested(self, name, want):
+        def ingest_confirmed(self, name, digest):
             return False
 
     seg = {"name": "seg_0004.aswf", "bytes": 4}

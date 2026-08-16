@@ -113,6 +113,7 @@ class RecorderCore:
         segs = wpc.list_segments(self.host)
         pending = sorted([s for s in segs if s.get("finalized")],
                          key=lambda s: int(s["idx"]))
+        new_rows = dup_ack = 0      # #DATA-7: чем закончился проход на самом деле
         for seg in pending:
             if self._stop.is_set():
                 return
@@ -123,9 +124,11 @@ class RecorderCore:
             for line in buf.getvalue().splitlines():
                 self._log(line.strip())
             if r == "ok" and rows:
+                new_rows += rows
                 self._log(f"✓ {seg['name']} +{rows} строк, стёрт на плате")
             elif r == "ok":
-                self._log(f"✓ {seg['name']} уже был вшит, только ack")
+                dup_ack += 1
+                self._log(f"✓ {seg['name']} уже был вшит (отпечаток сошёлся), только ack")
             elif r == "sizemismatch":
                 self._log(f"~ {seg['name']} размер не сошёлся, повтор позже")
             else:
@@ -133,6 +136,13 @@ class RecorderCore:
             if gap is not None:
                 self._log(f"⚠ пауза платы перед {seg['name']}: {gap:+.0f} с")
             self._account_integrity(seg, diag)
+        # #DATA-7: проход, где плата отдала сегменты, а в шов не легло ни строки, —
+        # аномалия, и раньше она выглядела как норма: diag=None у каждого сегмента,
+        # _account_integrity выходил первой строкой, индикатор оставался зелёным.
+        # Ровно так молча ушли 66 сегментов. Теперь это видно в журнале.
+        if dup_ack and not new_rows:
+            self._log(f"⚠ проход: {dup_ack} сегм. подтверждено и стёрто на плате, "
+                      f"в шов добавлено 0 строк — все опознаны как уже вшитые ранее")
         self.last_pass = time.time()
 
     def _account_integrity(self, seg, diag):
