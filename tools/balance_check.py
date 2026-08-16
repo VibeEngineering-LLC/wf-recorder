@@ -86,6 +86,28 @@ def reconcile_by_identity(segments_before, segments_after):
     still_present = [name for name in before_finalized if name in after_names]
     return sum(transferred.values()), sorted(transferred), still_present
 
+def bounded_consistency(transferred_rows, rows_written, produced_by_board, seg_rows=64):
+    """#TEST-1 (A2): вердикт для сегментов, рождённых И потреблённых ВНУТРИ окна.
+
+    reconcile_by_identity видит только то, что было finalized уже в 'before' —
+    сегмент, целиком возникший и переданный в паузе между снимками, ей не
+    виден вовсе. Единственная проверка, которая тут доступна: избыток
+    (rows_written сверх известного backlog) должен объясняться либо
+    производством за окно (total_rows delta), либо скрытым буфером открытого
+    сегмента на ОДНОЙ из двух границ — а тот не может превышать (seg_rows-1)
+    строк по определению (иначе сегмент уже финализировался бы).
+    """
+    excess = rows_written - transferred_rows
+    if excess < 0:
+        return "MISSING", excess, None  # известный backlog не весь долетел — жёсткий провал
+    if excess == 0:
+        return "EXACT", excess, None  # весь избыток отсутствует — born-and-consumed нет вовсе
+    slack = excess - produced_by_board
+    bound = seg_rows - 1
+    if -bound <= slack <= bound:
+        return "BOUNDED", excess, slack  # объяснимо скрытым буфером, реальной потери не видно
+    return "UNEXPLAINED", excess, slack  # выходит за физически возможное — настоящая находка
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--before", required=True)
@@ -154,6 +176,8 @@ def main():
     transferred_rows, transferred_names, still_present = reconcile_by_identity(
         segments_before, segments_after)
     open_seg_present = has_open_segment(segments_before) or has_open_segment(segments_after)
+    verdict_kind, excess, slack = bounded_consistency(
+        transferred_rows, rows_written, produced_by_board)
 
     for seg in segments_before or []:
         if seg.get("bytes", 0) > 0 and "rows" in seg:
@@ -167,18 +191,19 @@ def main():
             if expected_rows != seg["rows"]:
                 print(f"⚠ сегмент {seg['name']}: заявлено rows={seg['rows']}, из размера следует {expected_rows} — плата сообщает о себе неверно", file=sys.stderr)
     
-    # Вывод. Главный вердикт — по идентичности сегментов (см. reconcile_by_identity):
-    # это единственная сверка, не зависящая от слепого пятна на открытом сегменте.
-    # Агрегатная арифметика (diff/expected_balance) остаётся СПРАВОЧНОЙ — при
-    # open_seg_present она заведомо ненадёжна и не должна решать вердикт.
+    # Вывод. Главный вердикт — trёхзначный (см. bounded_consistency): различает
+    # «точно сошлось», «сошлось в пределах физически возможного скрытого буфера
+    # открытого сегмента» и «настоящее расхождение». Агрегатная арифметика
+    # (diff/expected_balance) остаётся СПРАВОЧНОЙ, вердикт не решает.
     diff = produced_by_board - expected_balance
-    identity_diff = rows_written - transferred_rows
-    verdict_ok = (identity_diff == 0)
+    verdict_pass = verdict_kind in ("EXACT", "BOUNDED")
 
     if args.json:
         result = {
+            "verdict": verdict_kind,
             "identity_transferred_rows": transferred_rows,
-            "identity_diff": identity_diff,
+            "excess_rows": excess,
+            "slack": slack,
             "open_segment_present": open_seg_present,
             "produced_by_board": produced_by_board,
             "written_to_pc": rows_written,
@@ -188,7 +213,7 @@ def main():
             "aggregate_difference": diff
         }
         print(json.dumps(result, ensure_ascii=False))
-        sys.exit(0 if verdict_ok else 1)
+        sys.exit(0 if verdict_pass else 1)
     else:
         print(f"перенесено сегментов (по идентичности): {len(transferred_names)}, "
               f"строк: {transferred_rows}")
@@ -199,13 +224,18 @@ def main():
         print(f"  справочно: произведено_платой={produced_by_board} "
               f"вытеснено_кольцом={dropped_by_ring} осталось_на_плате={remaining_on_board} "
               f"агрегатное_расхождение={diff}")
-        if verdict_ok:
-            print("БАЛАНС СОШЁЛСЯ (по идентичности сегментов)")
-            sys.exit(0)
+        if verdict_kind == "EXACT":
+            print("БАЛАНС СОШЁЛСЯ ТОЧНО (по идентичности сегментов)")
+        elif verdict_kind == "BOUNDED":
+            print(f"БАЛАНС СОШЁЛСЯ В ПРЕДЕЛАХ ФИЗИЧЕСКОГО (избыток {excess} строк объясним "
+                  f"скрытым буфером открытого сегмента на границе окна, slack={slack})")
+        elif verdict_kind == "MISSING":
+            print(f"БАЛАНС НЕ СОШЁЛСЯ: известный backlog {transferred_names} "
+                  f"({transferred_rows} строк) не весь долетел до ПК (записано {rows_written})")
         else:
-            print(f"БАЛАНС НЕ СОШЁЛСЯ: расхождение {identity_diff} строк "
-                  f"(перенесено {transferred_names} не совпадает с записанным на ПК)")
-            sys.exit(1)
+            print(f"БАЛАНС НЕ СОШЁЛСЯ: избыток {excess} строк выходит за физически "
+                  f"возможный предел (slack={slack}, произведено_платой={produced_by_board})")
+        sys.exit(0 if verdict_pass else 1)
 
 if __name__ == "__main__":
     main()
