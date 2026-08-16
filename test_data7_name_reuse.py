@@ -140,12 +140,13 @@ TS_OFF = 16386     # абсолютный таймстамп строки, uint3
 CRC_OFF = 16390    # crc32 строки, uint32; covers = CRC_OFF
 
 
-def _make_seg(rows_counts, started_at=1700000000, seg_seq=0):
+def _make_seg(rows_counts, started_at=1700000000, seg_seq=0, stride=None):
+    stride = stride or STRIDE      # другой stride = другой формат строки (#REC-14)
     # Строим заголовок
     header = {
         "version": 5,
         "channels": CH,
-        "row_stride": STRIDE,
+        "row_stride": stride,
         "saved_rows": 0,
         "started_at": started_at,
         "seg_seq": seg_seq,
@@ -163,7 +164,7 @@ def _make_seg(rows_counts, started_at=1700000000, seg_seq=0):
     hj_bytes = hj.encode("utf-8")
     body = bytearray()
     for i, row_data in enumerate(rows_counts):
-        b = bytearray(STRIDE)
+        b = bytearray(stride)
         for j in range(CH):
             offset = SPEC_OFF + j * 2
             b[offset:offset+2] = struct.pack("<H", row_data[j])
@@ -242,5 +243,27 @@ def test_e2e_nastoyashiy_dubl_ne_dubliruet_stroki(monkeypatch, tmp_path):
     assert st.state["rows"] == rows_before
     assert shov.stat().st_size == size_before, "файл шва вырос на повторе"
     assert acks == [1], "ack не отправлен: сегмент навсегда останется на плате"
+
+
+def test_proverka_vnutri_rotacii_dostizhima(tmp_path):
+    """Защита от дублей внутри append_segment при ротации формата (#REC-14) —
+    НЕ мёртвый код: _rotate_for_format вызывает _load_state(), то есть подменяет
+    state целиком на state ДРУГОГО файла шва. Внешняя проверка в fetch_one_stitch
+    смотрела в прежний state и ответа за новый дать не может."""
+    base = str(tmp_path / "shov.aswf")
+    old = _make_seg([[10] * CH, [11] * CH], seg_seq=1, stride=16402)
+    st = wpc.Stitcher(base)
+    st.append_segment("seg_00001.aswf", old)
+
+    new = _make_seg([[20] * CH, [21] * CH], seg_seq=2)      # stride 16410 -> ротация
+    assert st.append_segment("seg_00002.aswf", new)[0] == 2, "сегмент не вшит после ротации"
+
+    # рестарт клиента на исходном пути: state снова от ПЕРВОГО файла шва
+    st2 = wpc.Stitcher(base)
+    assert not st2.ingest_confirmed("seg_00002.aswf", wpc.seg_digest(new)), \
+        "внешняя проверка знает про сегмент — тогда append_segment не вызвали бы"
+
+    rows, _, _ = st2.append_segment("seg_00002.aswf", new)
+    assert rows == 0, "строки продублированы: проверка внутри ротации не сработала"
 
 
