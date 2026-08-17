@@ -303,6 +303,15 @@ class RecorderUI:
         self.log.config(state="disabled")
 
     def toggle(self):
+        # #DATA-9 (Codeaudit): вся гарантия «двух ядер не бывает» держится на
+        # негласном инварианте «toggle зовётся только из UI-потока» (кнопка,
+        # --autostart) — нигде в коде это не закреплено. Один вызов toggle() из
+        # фонового потока тихо снял бы инвариант: два вызова конкурентно пройдут
+        # проверку is_alive() до создания ядра. Дёшево закрыть явно, а не
+        # полагаться на то, что через полгода кто-то об этом вспомнит.
+        assert threading.current_thread() is threading.main_thread(), (
+            "#DATA-9: toggle() вызван не из UI-потока — инвариант защиты от "
+            "второго ядра нарушен")
         if self.core and self.core.running:
             ok = self.core.stop(timeout=3.0)
             if not ok:
