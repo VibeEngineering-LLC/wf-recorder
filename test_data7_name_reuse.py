@@ -45,6 +45,9 @@ def test_stitch_kachaet_dazhe_pri_sovpadenii_imeni(monkeypatch):
         def note_sizemismatch(self, name):
             return 1
 
+        def ingest_crc_bad(self, name):
+            return False         # #DATA-8: сегмент не помечен битым
+
         def clear_sizemismatch(self, name):
             pass
 
