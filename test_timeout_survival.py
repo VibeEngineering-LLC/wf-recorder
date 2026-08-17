@@ -61,6 +61,9 @@ def test_fetch_one_stitch_survives_delete_timeout(monkeypatch):
         def ingest_confirmed(self, name, digest):
             return True          # #DATA-7: подтверждённый дубль — строки уже в шве
 
+        def clear_sizemismatch(self, name):
+            pass
+
     seg = {"name": "seg_0002.aswf", "bytes": 4}
 
     def mock_ack_delete(*args, **kwargs):

@@ -42,6 +42,12 @@ def test_stitch_kachaet_dazhe_pri_sovpadenii_imeni(monkeypatch):
         def ingest_confirmed(self, name, digest):
             return False
 
+        def note_sizemismatch(self, name):
+            return 1
+
+        def clear_sizemismatch(self, name):
+            pass
+
         def append_segment(self, name, blob):
             self.append_segment_called = True
             return (4, None, {"crc_bad": 0, "crc_checked": 4, "seq_gap": 0, "recon": None})

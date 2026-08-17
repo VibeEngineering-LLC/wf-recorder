@@ -68,8 +68,22 @@ class RecorderCore:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self, timeout=3.0):
+        """#DATA-9: остановить поток и ДОЖДАТЬСЯ его реального завершения (join),
+        не только выставить флаг. Без этого Stop→Start мог создать ВТОРОЕ ядро
+        поверх ещё живого первого — оба независимо пишут в один файл шва.
+
+        threading.Event.wait() внутри _loop() прерывается мгновенно при set(),
+        так что join(timeout) не обязан ждать полный self.interval.
+
+        Возвращает True, если поток гарантированно мёртв к моменту возврата;
+        False — не уложился в timeout, вызывающий не должен считать запись
+        остановленной (и не должен запускать новую поверх этой)."""
         self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=timeout)
+            return not self._thread.is_alive()
+        return True
 
     @property
     def running(self):
@@ -280,10 +294,29 @@ class RecorderUI:
         if os.path.isdir(d):
             subprocess.Popen(["explorer", d])
 
+    def _log_ui(self, msg):
+        """#DATA-9: запись в журнал GUI напрямую, минуя core.events — нужна и
+        когда self.core ещё None/уже не running."""
+        self.log.config(state="normal")
+        self.log.insert("end", time.strftime("%H:%M:%S") + "  " + msg + "\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
     def toggle(self):
         if self.core and self.core.running:
-            self.core.stop()
+            ok = self.core.stop(timeout=3.0)
+            if not ok:
+                self._log_ui("⚠ #DATA-9: поток записи не остановился за 3 с — "
+                             "новый Старт заблокирован, дождитесь остановки")
+                self.btn.config(text="⏳ Останавливается…")
+                return
             self.btn.config(text="▶ Старт")
+            return
+        # #DATA-9: даже при running=False поток мог быть ещё физически жив —
+        # не полагаться на running, проверить факт напрямую.
+        if self.core and self.core._thread and self.core._thread.is_alive():
+            self._log_ui("⚠ #DATA-9: предыдущий поток ещё не завершился — Старт "
+                         "заблокирован, чтобы не создать второе ядро на файле")
             return
         try:
             interval = max(5, int(self.int_var.get()))
