@@ -196,11 +196,43 @@ class Stitcher:
         if file_ok and os.path.exists(self.state_path):
             with open(self.state_path, "r", encoding="utf-8") as f:
                 self.state = json.load(f)
+            self._validate_schema()
         else:
             if os.path.exists(self.state_path) and not file_ok:
                 print(f"  ⚠ {path} отсутствует/пуст, а {self.state_path} есть — "
                       f"файл шва перемещён/удалён вручную, начинаю новый (state сброшен)")
             self.state = {"ingested": {}, "rows": 0, "dur_sum": 0, "started_at": None}
+
+    def _validate_schema(self):
+        """#DATA-9: state.json чужой схемы (ручная правка, старая/сторонняя
+        версия, повреждение) не должен ронять весь процесс KeyError-ом при
+        первом же обращении. Гарантирует после вызова: self.state — dict с
+        обязательными ключами правильных типов."""
+        if not isinstance(self.state, dict):
+            print(f"  ⚠ {self.state_path}: не объект (получен {type(self.state).__name__}) "
+                  f"— state сброшен, начинаю заново")
+            self.state = {}
+        if not isinstance(self.state.get("ingested"), dict):
+            self.state["ingested"] = {}
+        for key, default in (("rows", 0), ("dur_sum", 0), ("started_at", None)):
+            if key not in self.state:
+                self.state[key] = default
+
+    def note_sizemismatch(self, name):
+        """#DATA-9: считаем ПОДРЯДНЫЕ sizemismatch по имени сегмента — транзиентная
+        гонка записи проходит за 1-2 повтора, системная проблема платы не проходит
+        никогда. Не персистентно (в память, не в state.json) — переживать рестарт
+        процесса счётчику не нужно, цель — не молчать в ТЕКУЩЕМ долгом прогоне."""
+        c = getattr(self, "_sizemismatch_counts", None)
+        if c is None:
+            c = self._sizemismatch_counts = {}
+        c[name] = c.get(name, 0) + 1
+        return c[name]
+
+    def clear_sizemismatch(self, name):
+        c = getattr(self, "_sizemismatch_counts", None)
+        if c:
+            c.pop(name, None)
 
     def _rotated_path(self, stride):
         """#REC-14: путь нового файла шва при смене формата прошивки —
@@ -486,7 +518,12 @@ def fetch_one_stitch(host, stitcher, seg, token):
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
         return f"error:get:{e}", 0, None, None
     if len(blob) != want:
+        n = stitcher.note_sizemismatch(name)
+        if n >= 3:
+            print(f"  ❗ #DATA-9: {name} sizemismatch {n} раз подряд — похоже на "
+                  f"системную проблему платы, не на транзиентную гонку записи")
         return "sizemismatch", 0, None, None   # не удаляем — заберём в след. проходе
+    stitcher.clear_sizemismatch(name)
 
     if stitcher.ingest_confirmed(name, seg_digest(blob)):
         rows, gap, diag = 0, None, None       # тот же самый сегмент: строки уже в шве
