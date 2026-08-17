@@ -307,6 +307,15 @@ class Stitcher:
         rec = self.state["ingested"].get(name)
         return isinstance(rec, dict) and rec.get("d") == digest
 
+    def ingest_crc_bad(self, name):
+        """#DATA-8 (находка Codeaudit P1, 2026-08-17): признак порчи обязан жить
+        в СОСТОЯНИИ, а не в diag одного прохода. Раньше удержание ack работало
+        только на первом проходе: на втором ingest_confirmed возвращал True,
+        diag обнулялся, held-ветка пропускалась и битый сегмент удалялся — тот
+        же дефект, что чинили, только с задержкой на один интервал."""
+        rec = self.state["ingested"].get(name)
+        return isinstance(rec, dict) and bool(rec.get("crc_bad"))
+
     def append_segment(self, name, blob):
         """Дозаписать строки сегмента в единый файл.
         -> (rows_added, gap_sec|None, diag dict).
@@ -407,7 +416,7 @@ class Stitcher:
             # сегмента, иначе следующая попытка допишет тот же блок ПОВЕРХ
             # огрызка и все смещения после перестанут быть кратны stride
             # (воспроизведено: 16 из 21 строки становятся нечитаемыми).
-            pre_size = os.path.getsize(self.path)
+            pre_size = self._truncate_orphan_tail(stride, name)
             try:
                 with open(self.path, "ab") as f:
                     f.write(whole)
@@ -418,7 +427,10 @@ class Stitcher:
                     tf.truncate(pre_size)
                 raise
 
-        self.state["ingested"][name] = {"b": len(blob), "d": seg_digest(blob)}
+        rec = {"b": len(blob), "d": seg_digest(blob)}
+        if crc_bad:
+            rec["crc_bad"] = True      # #DATA-8: переживает проход, см. ingest_crc_bad
+        self.state["ingested"][name] = rec
         self._trim_ingested()
         self.state["rows"] = self.state.get("rows", 0) + n_rows
         self.state["dur_sum"] = self.state.get("dur_sum", 0) + dur
@@ -434,6 +446,37 @@ class Stitcher:
         self._save_state()
         return n_rows, gap, {"crc_bad": crc_bad, "crc_checked": crc_checked,
                              "seq_gap": seq_gap, "recon": recon}
+
+    def _truncate_orphan_tail(self, stride, name):
+        """#DATA-8 (находка Codeaudit P2, 2026-08-17): срезать неполную строку в
+        хвосте файла шва ДО дозаписи. Откат по OSError покрывает только сбои,
+        которые мы успеваем перехватить; kill -9 и потеря питания ПК оставляют
+        огрызок, а выполнить truncate некому. Дозапись через 'ab' легла бы
+        ПОВЕРХ него, и огрызок оказался бы в СЕРЕДИНЕ файла — разбор .aswf
+        отбрасывает только хвост, поэтому нечитаемым стало бы всё, что после.
+        -> размер файла после возможной обрезки."""
+        size = os.path.getsize(self.path)
+        rem = (size - self._prefix_len()) % stride
+        if not rem:
+            return size
+        with open(self.path, "r+b") as f:
+            f.truncate(size - rem)
+        print(f"  ⚠ #DATA-8 перед {name}: в файле шва найдена неполная строка "
+              f"({rem} B) — обрезана. Признак аварийного завершения прошлого "
+              f"процесса (kill/питание); целые строки не затронуты.")
+        return size - rem
+
+    def _prefix_len(self):
+        """Длина шапки файла шва (magic+hlen+json[+baseline]) — граница, от
+        которой payload обязан быть кратен stride."""
+        with open(self.path, "rb") as f:
+            hlen = struct.unpack_from("<I", f.read(8), 4)[0]
+            hdr = json.loads(f.read(hlen).decode("utf-8"))
+        n = 8 + hlen
+        if "baseline" in hdr:
+            b = hdr["baseline"]
+            n += b.get("channels", b.get("count", 0)) * 4
+        return n
 
     def _file_header(self):
         with open(self.path, "rb") as f:
@@ -581,11 +624,13 @@ def fetch_one_stitch(host, stitcher, seg, token):
         except (ValueError, OSError) as e:
             return f"error:stitch:{e}", 0, None, None
 
-    if diag and diag.get("crc_bad"):
-        # #DATA-8: детектор CRC сработал — ack не уходит. Строки уже легли в
-        # шов (с пометкой), но хорошая копия на плате обязана пережить эту
-        # находку: удаление здесь стирало последний целый экземпляр данных,
-        # а битый оставался единственным на диске.
+    # #DATA-8: детектор CRC сработал — ack не уходит. Строки уже легли в шов
+    # (с пометкой), но хорошая копия на плате обязана пережить эту находку:
+    # удаление здесь стирало последний целый экземпляр данных, а битый
+    # оставался единственным на диске. Проверяются ОБА источника: diag свежей
+    # вшивки И флаг в state — иначе удержание жило бы ровно один проход
+    # (находка Codeaudit P1: на 2-м проходе diag=None, ack уходил).
+    if (diag and diag.get("crc_bad")) or stitcher.ingest_crc_bad(name):
         return "held:crc_bad", rows, gap, diag
     try:
         ok = ack_delete(host, name, token)
@@ -649,9 +694,14 @@ def one_pass(host, out_dir, stitcher):
             # #DATA-8: строки вшиты (с пометкой), но плата НЕ очищена —
             # решение об удалении следует за детектором, а не идёт параллельно.
             held += 1
-            cb, cc = diag["crc_bad"], diag["crc_checked"]
-            print(f"  ⚠ {seg['name']}  {seg['bytes']} B  CRC32 {cb}/{cc} строк "
-                  f"битые — вшито с пометкой, ack УДЕРЖАН (плата не очищена)")
+            if diag:
+                cb, cc = diag["crc_bad"], diag["crc_checked"]
+                print(f"  ⚠ {seg['name']}  {seg['bytes']} B  CRC32 {cb}/{cc} строк "
+                      f"битые — вшито с пометкой, ack УДЕРЖАН (плата не очищена)")
+            else:
+                # повторный проход: строки уже в шве, признак порчи взят из state
+                print(f"  ⚠ {seg['name']}  {seg['bytes']} B  помечен битым ранее — "
+                      f"ack УДЕРЖАН, сегмент намеренно оставлен на плате")
         else:
             failed += 1
             print(f"  ✗ {seg['name']}  {r}")

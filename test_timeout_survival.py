@@ -66,6 +66,9 @@ def test_fetch_one_stitch_survives_delete_timeout(monkeypatch):
         def ingest_confirmed(self, name, digest):
             return True          # #DATA-7: подтверждённый дубль — строки уже в шве
 
+        def ingest_crc_bad(self, name):
+            return False         # #DATA-8: сегмент не помечен битым
+
         def clear_sizemismatch(self, name):
             pass
 
