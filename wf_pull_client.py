@@ -671,8 +671,20 @@ def one_pass(host, out_dir, stitcher):
                           + (f"  ✗ ПОРЧА {cb} строк!" if cb else ""))
                 sg = diag["seq_gap"]
                 if sg is not None and sg > 0:
-                    print(f"    ⚠ #DATA-1b пропуск {sg} сегм. (кольцо стёрло до pull) — "
-                          f"данные потеряны безвозвратно")
+                    # #DATA-11: клиент видит РАЗРЫВ СЧЁТЧИКА, а не факт потери.
+                    # Прежний текст утверждал «потеряны безвозвратно» и вводил в
+                    # заблуждение: у пользователя из issue #1 пропущенный сегмент
+                    # остался на плате после таймаута, а сообщение объявило его
+                    # потерянным. Три разные причины разрыва — три разных исхода.
+                    print(f"    ⚠ #DATA-1b разрыв счётчика сегментов: пропущено {sg}")
+                    if failed:
+                        print(f"      выше в этом проходе были ошибки — вероятно, эти "
+                              f"сегменты ЕЩЁ НА ПЛАТЕ, заберутся следующим проходом")
+                    else:
+                        print(f"      сегмента на плате нет. Причины: вытеснен кольцом "
+                              f"(забор реже, чем плата пишет) либо оборван перезагрузкой "
+                              f"(незавершённый сегмент не переживает ребут — так устроена "
+                              f"запись). Сверьте seg_dropped в /api/waterfall/status")
                 elif sg is not None and sg < 0:
                     print(f"    ⚠ #DATA-1b seg_seq откат {sg} (дубль/реордер)")
                 rc = diag["recon"]
@@ -757,9 +769,20 @@ def main():
             one_pass(host, out_dir, stitcher)
         except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError, TimeoutError) as e:
             print(f"проход не удался: {e}")
+        except KeyboardInterrupt:
+            # #DATA-10: Ctrl+C — штатный способ остановки, а не сбой. Простыня
+            # traceback пугает и заставляет думать, что данные пострадали.
+            # Строки уже на диске (fsync до ack), состояние согласовано.
+            print("\nостановлено пользователем (Ctrl+C); записанное на диске цело")
+            return 0
         if args.once:
             break
-        time.sleep(args.interval)
+        try:
+            time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nостановлено пользователем (Ctrl+C)")
+            return 0
+    return 0
 
 
 if __name__ == "__main__":
