@@ -146,7 +146,7 @@ TS_OFF = 16386     # абсолютный таймстамп строки, uint3
 CRC_OFF = 16390    # crc32 строки, uint32; covers = CRC_OFF
 
 
-def _make_seg(rows_counts, started_at=1700000000, seg_seq=0, stride=None):
+def _make_seg(rows_counts, started_at=1700000000, seg_seq=0, stride=None, calibration=None):
     stride = stride or STRIDE      # другой stride = другой формат строки (#REC-14)
     # Строим заголовок
     header = {
@@ -158,7 +158,7 @@ def _make_seg(rows_counts, started_at=1700000000, seg_seq=0, stride=None):
         "seg_seq": seg_seq,
         "total_at_open": 0,
         "interval_sec": 180,
-        "calibration": [0.0, 3.0, 0.0],
+        "calibration": calibration if calibration is not None else [0.0, 3.0, 0.0],
         "row_fields": [
             {"name": "spectrum", "offset": SPEC_OFF},
             {"name": "duration", "offset": DUR_OFF},
