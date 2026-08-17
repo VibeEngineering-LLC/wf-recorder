@@ -93,9 +93,12 @@ def test_stitch_ne_ackaet_bez_skachivaniya(monkeypatch):
     assert status.startswith("error:get:")
 
 def test_filemode_ne_zatiraet_tezku(tmp_path, monkeypatch):
-    """fetch_one_filemode не затирает существующий файл с тем же именем."""
-    blob_a = b"A" * 100
-    blob_b = b"B" * 100
+    """fetch_one_filemode не затирает существующий файл с тем же именем.
+
+    #DATA-8 место 4: с валидацией parse_aswf blob обязан быть настоящим ASWF,
+    иначе тест падает на "bad magic" раньше проверки затирания — не по адресу."""
+    blob_a = _make_seg([[10] * CH])
+    blob_b = _make_seg([[20] * CH])
     file_path = tmp_path / "seg_00006.aswf"
     file_path.write_bytes(blob_a)
     calls = []
@@ -110,7 +113,7 @@ def test_filemode_ne_zatiraet_tezku(tmp_path, monkeypatch):
     monkeypatch.setattr(wpc, "http_get", mock_http_get)
     monkeypatch.setattr(wpc, "ack_delete", mock_ack_delete)
 
-    seg = {"name": "seg_00006.aswf", "bytes": 100}
+    seg = {"name": "seg_00006.aswf", "bytes": len(blob_b)}
     wpc.fetch_one_filemode("host", str(tmp_path), seg, "token")
 
     assert file_path.read_bytes() == blob_a, "существующий файл затёрт тёзкой"

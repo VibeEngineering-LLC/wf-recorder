@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 import pytest
 import wf_pull_client as wpc
+from test_data7_name_reuse import _make_seg, CH
 
 
 def test_timeout_is_not_urlerror():
@@ -39,17 +40,21 @@ def test_timeout_propagates_from_network_layer(monkeypatch, call):
 
 
 def test_fetch_one_filemode_survives_delete_timeout(monkeypatch, tmp_path):
-    """Проверяет, что fetch_one_filemode выживает при TimeoutError в ack_delete."""
-    seg = {"name": "seg_0001.aswf", "bytes": 4}
+    """Проверяет, что fetch_one_filemode выживает при TimeoutError в ack_delete.
+
+    #DATA-8 место 4: blob обязан быть настоящим ASWF — с валидацией контента
+    фейковый b"data" отсекается раньше, до ack_delete, и тест бы падал не там."""
+    blob = _make_seg([[10] * CH])
+    seg = {"name": "seg_0001.aswf", "bytes": len(blob)}
     file_path = tmp_path / seg["name"]
-    file_path.write_bytes(b"data")
+    file_path.write_bytes(blob)
 
     def mock_ack_delete(*args, **kwargs):
         raise TimeoutError("board rebooted before responding to delete")
 
     # #DATA-7: скачивание больше не пропускается по совпадению (имя, размер),
     # поэтому до ack_delete тест доходит только с рабочим http_get
-    monkeypatch.setattr(wpc, "http_get", lambda *a, **k: b"data")
+    monkeypatch.setattr(wpc, "http_get", lambda *a, **k: blob)
     monkeypatch.setattr(wpc, "ack_delete", mock_ack_delete)
     result = wpc.fetch_one_filemode("http://board", str(tmp_path), seg, "tok")
     assert result.startswith("error:del:"), f"Ожидался статус с 'error:del:', но получено: {result}"

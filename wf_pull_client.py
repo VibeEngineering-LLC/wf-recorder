@@ -376,11 +376,19 @@ class Stitcher:
         gap = None
         if not os.path.exists(self.path):
             # первый сегмент задаёт шапку файла (saved_rows=0 -> derive-from-size)
-            with open(self.path, "wb") as f:
-                f.write(prefix)
-                f.write(whole)
-                f.flush()
-                os.fsync(f.fileno())
+            try:
+                with open(self.path, "wb") as f:
+                    f.write(prefix)
+                    f.write(whole)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                # #DATA-8: обрыв посреди записи первого сегмента эпохи — не
+                # оставлять огрызок; следующая попытка должна снова увидеть
+                # "файла нет", а не дописывать поверх повреждённого начала.
+                if os.path.exists(self.path):
+                    os.remove(self.path)
+                raise
             self.state["started_at"] = hdr.get("started_at")
         else:
             # #DATA-8: калибровка проверена и, при расхождении, обработана
@@ -394,10 +402,21 @@ class Stitcher:
                 delta = seg_start - last_end
                 if abs(delta) > 2 * max(hdr.get("interval_sec", 60), 60):
                     gap = delta
-            with open(self.path, "ab") as f:
-                f.write(whole)
-                f.flush()
-                os.fsync(f.fileno())
+            # #DATA-8: обрыв дозаписи не должен разъезжать границы строк — при
+            # сбое посреди write/fsync откатываем файл к размеру ДО этого
+            # сегмента, иначе следующая попытка допишет тот же блок ПОВЕРХ
+            # огрызка и все смещения после перестанут быть кратны stride
+            # (воспроизведено: 16 из 21 строки становятся нечитаемыми).
+            pre_size = os.path.getsize(self.path)
+            try:
+                with open(self.path, "ab") as f:
+                    f.write(whole)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                with open(self.path, "r+b") as tf:
+                    tf.truncate(pre_size)
+                raise
 
         self.state["ingested"][name] = {"b": len(blob), "d": seg_digest(blob)}
         self._trim_ingested()
@@ -501,6 +520,13 @@ def fetch_one_filemode(host, out_dir, seg, token):
         return f"error:get:{e}"
     if len(blob) != want:
         return "sizemismatch"                     # не удаляем на плате — заберём позже
+    try:
+        # #DATA-8: файловый режим проверял только размер, не содержимое —
+        # совпадение размера с HTML-страницей ошибки (прокси/VPN) шло прямиком
+        # в ack. parse_aswf здесь только для валидации, сырой blob пишем как есть.
+        parse_aswf(blob, name)
+    except (ValueError, KeyError, UnicodeDecodeError, struct.error) as e:
+        return f"error:badcontent:{e}"
 
     dst = _spare_collision(dst, blob, name)
     tmp = dst + ".part"
@@ -555,6 +581,12 @@ def fetch_one_stitch(host, stitcher, seg, token):
         except (ValueError, OSError) as e:
             return f"error:stitch:{e}", 0, None, None
 
+    if diag and diag.get("crc_bad"):
+        # #DATA-8: детектор CRC сработал — ack не уходит. Строки уже легли в
+        # шов (с пометкой), но хорошая копия на плате обязана пережить эту
+        # находку: удаление здесь стирало последний целый экземпляр данных,
+        # а битый оставался единственным на диске.
+        return "held:crc_bad", rows, gap, diag
     try:
         ok = ack_delete(host, name, token)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
@@ -570,7 +602,7 @@ def one_pass(host, out_dir, stitcher):
             print(f"  T: t1={t[0]} t2={t[1]} t3={t[2]} -> {os.path.basename(stitcher.temps_path)}")
     segs = list_segments(host)
     pending = sorted([s for s in segs if s.get("finalized")], key=lambda s: int(s["idx"]))
-    got = skipped = failed = rows_total = dup_ack = 0
+    got = skipped = failed = held = rows_total = dup_ack = 0
     for seg in pending:
         if stitcher:
             r, rows, gap, diag = fetch_one_stitch(host, stitcher, seg, token)
@@ -613,6 +645,13 @@ def one_pass(host, out_dir, stitcher):
         elif r == "sizemismatch":
             skipped += 1
             print(f"  ~ {seg['name']}  размер не сошёлся — повтор в след. проходе")
+        elif r == "held:crc_bad":
+            # #DATA-8: строки вшиты (с пометкой), но плата НЕ очищена —
+            # решение об удалении следует за детектором, а не идёт параллельно.
+            held += 1
+            cb, cc = diag["crc_bad"], diag["crc_checked"]
+            print(f"  ⚠ {seg['name']}  {seg['bytes']} B  CRC32 {cb}/{cc} строк "
+                  f"битые — вшито с пометкой, ack УДЕРЖАН (плата не очищена)")
         else:
             failed += 1
             print(f"  ✗ {seg['name']}  {r}")
@@ -629,7 +668,7 @@ def one_pass(host, out_dir, stitcher):
               f"плате, в шов добавлено 0 строк. Это нормально только если вы "
               f"перезапустили забор уже забранных данных.")
     print(f"проход: забрано {got} (+{rows_total} строк), отложено {skipped}, "
-          f"ошибок {failed}, открытых (пропущены) {open_cnt}{tail}")
+          f"удержано {held} (CRC), ошибок {failed}, открытых (пропущены) {open_cnt}{tail}")
     return got, failed
 
 
