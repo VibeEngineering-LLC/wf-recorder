@@ -234,26 +234,45 @@ class Stitcher:
         if c:
             c.pop(name, None)
 
-    def _rotated_path(self, stride):
-        """#REC-14: путь нового файла шва при смене формата прошивки —
-        <base>__s<stride><ext>. Существующий суффикс __s… снимается (не наслаивается
-        при второй смене формата)."""
+    def _cal_suffix(self, calibration):
+        """#DATA-8: короткий детерминированный отпечаток калибровки для имени
+        файла — сама калибровка (список float) в имя не годится."""
+        h = hashlib.sha256(json.dumps(calibration, sort_keys=True).encode()).hexdigest()
+        return h[:8]
+
+    def _rotated_path(self, stride, calibration=None):
+        """#REC-14/#DATA-8: путь нового файла шва при смене формата прошивки
+        и/или калибровки — <base>__s<stride>__c<hash><ext>. Существующие
+        суффиксы __s.../__c... снимаются (не наслаиваются при повторной смене)."""
         d = os.path.dirname(self.path)
         root, ext = os.path.splitext(os.path.basename(self.path))
-        i = root.rfind("__s")
-        if i != -1 and root[i + 3:].isdigit():
-            root = root[:i]
-        return os.path.join(d, f"{root}__s{stride}{ext}")
+        for marker, is_suffix in (("__c", lambda s: len(s) == 8), ("__s", str.isdigit)):
+            i = root.rfind(marker)
+            if i != -1 and is_suffix(root[i + 3:]):
+                root = root[:i]
+        suffix = f"__s{stride}"
+        if calibration is not None:
+            suffix += f"__c{self._cal_suffix(calibration)}"
+        return os.path.join(d, f"{root}{suffix}{ext}")
 
-    def _rotate_for_format(self, new_ch, new_stride, old_ch, old_stride):
-        """Заморозить текущий файл шва и переключиться на новый (под новый формат).
-        Старый .aswf/.state.json/.temps.csv остаются на диске нетронутыми."""
+    def _rotate_for_epoch(self, new_ch, new_stride, old_ch, old_stride,
+                           new_cal=None, cal_changed=False):
+        """#REC-14/#DATA-8: заморозить текущий файл шва и переключиться на новый
+        при смене формата строки И/ИЛИ калибровки. Старый .aswf/.state.json/
+        .temps.csv остаются на диске нетронутыми -- решение об удалении
+        сегмента на плате не должно зависеть от того, что успело поменяться
+        в шапке прошивки."""
         old_path = self.path
-        self._set_paths(self._rotated_path(new_stride))
+        self._set_paths(self._rotated_path(new_stride, new_cal if cal_changed else None))
         self._load_state()
-        ch_note = "" if old_ch == new_ch else f", ch {old_ch}→{new_ch}"
-        print(f"  ⟳ #REC-14 смена формата прошивки платы: stride {old_stride}→{new_stride}"
-              f"{ch_note}; файл шва заморожен ({os.path.basename(old_path)}), "
+        parts = []
+        if old_stride != new_stride or old_ch != new_ch:
+            ch_note = "" if old_ch == new_ch else f", ch {old_ch}→{new_ch}"
+            parts.append(f"формат: stride {old_stride}→{new_stride}{ch_note}")
+        if cal_changed:
+            parts.append(f"калибровка сегмента ≠ калибровке файла шва")
+        print(f"  ⟳ #REC-14/#DATA-8 смена {' и '.join(parts)}; "
+              f"файл шва заморожен ({os.path.basename(old_path)}), "
               f"новые строки → {os.path.basename(self.path)}")
 
     def _save_state(self):
@@ -329,17 +348,22 @@ class Stitcher:
             device_delta = tao - last_tao
             recon = (device_delta, last_sum, device_delta - last_sum)
 
-        # #REC-14: смена формата строки в прошивке платы (напр. v3 stride 16402 →
-        # v5 16410) больше НЕ роняет запись. Активный файл шва замораживается, а
-        # новый формат пишется в отдельный <base>__s<stride>.aswf. Мешать строки
-        # разной длины в один файл нельзя — читатель раскладывает водопад по stride
-        # из шапки, и весь хвост после шва стал бы кашей.
+        # #REC-14/#DATA-8: смена формата строки ИЛИ калибровки в прошивке
+        # платы больше НЕ роняет запись и не вшивает строки под чужой шапкой.
+        # Активный файл шва замораживается, новая эпоха пишется в отдельный
+        # <base>__s<stride>[__c<hash>].aswf. Раньше калибровка только логи-
+        # ровалась ("детектор сработал, ack всё равно ушёл") — строки реально
+        # ложились в файл с чужой калибровкой, пики оказывались не на своих
+        # энергиях при внешне валидных данных (#DATA-8).
         if os.path.exists(self.path):
-            _, fstride, fch = self._file_header()
-            if fch != ch or fstride != stride:
-                self._rotate_for_format(ch, stride, fch, fstride)
+            fhdr, fstride, fch = self._file_header()
+            cal_changed = hdr.get("calibration") != fhdr.get("calibration")
+            if fch != ch or fstride != stride or cal_changed:
+                self._rotate_for_epoch(ch, stride, fch, fstride,
+                                       new_cal=hdr.get("calibration"),
+                                       cal_changed=cal_changed)
                 # NB: это НЕ дубль внешней проверки из fetch_one_stitch, хотя выглядит
-                # ею. _rotate_for_format выше вызвал _load_state() — self.state целиком
+                # ею. _rotate_for_epoch выше вызвал _load_state() — self.state целиком
                 # заменён на state ДРУГОГО файла шва. Внешняя проверка смотрела в прежний
                 # state и про этот файл ничего знать не могла. Удаление ветки даёт дубли
                 # строк при рестарте после ротации; закреплено тестом
@@ -359,10 +383,8 @@ class Stitcher:
                 os.fsync(f.fileno())
             self.state["started_at"] = hdr.get("started_at")
         else:
-            fhdr = self._file_header()[0]
-            if hdr.get("calibration") != fhdr.get("calibration"):
-                print(f"  ⚠ {name}: калибровка сегмента ≠ калибровке файла шва "
-                      f"(в шапке остаётся первая)")
+            # #DATA-8: калибровка проверена и, при расхождении, обработана
+            # ротацией ВЫШЕ (до этого блока) — сюда доходит уже согласованная.
             # детект паузы платы: цепочка от ПРЕДЫДУЩЕГО сегмента (ожидаемое начало
             # = его started_at + его длительность). started_at < 1e9 = часы платы
             # ещё не синхронизированы SNTP (наблюдался started_at=1) — не сравниваем.
