@@ -28,7 +28,7 @@
 
 ## Запуск
 
-Готовый `wf_recorder.exe` — в разделе [Releases](../../releases) (сборка PyInstaller, без
+Готовый `wf-recorder-v<версия>.exe` — в разделе [Releases](../../releases) (сборка PyInstaller, без
 установки Python).
 
 Из исходников:
@@ -42,14 +42,21 @@ python wf_recorder_app.py --host http://<IP-платы> --interval 60
 ```
 
 Требуется Python 3.8+ (только stdlib). Служебные флаги самопроверки: `--autostart`,
-`--exit-after N`, `--stitch FILE`.
+`--exit-after N`, `--stitch FILE`. Версию печатает `--version`.
+
+## Версия
+
+Единственный источник версии — [`_version.py`](_version.py) (`__version__`). Она видна в
+трёх местах: **имя файла** (`wf-recorder-v0.4.0.exe`), флаг **`--version`** и **в окне**
+программы (серая строка внизу; клик по ней — «О программе»). При сборке имя exe берёт версию
+из `_version.py`, так что две сборки разных версий нельзя спутать (issue #2).
 
 ## Сборка exe
 
 ```bat
 pip install pyinstaller
 pyinstaller wf_recorder.spec
-:: результат: dist\wf_recorder.exe
+:: результат: dist\wf-recorder-v0.4.0.exe (имя с версией — из _version.py)
 ```
 
 ## Если в журнале «разрыв в нумерации сегментов»
@@ -116,7 +123,8 @@ curl -X POST http://<IP-платы>/api/waterfall/config -d "{\"persist\": false
 |---|---|
 | `wf_recorder_app.py` | UI-программа (tkinter) поверх pull-клиента |
 | `wf_pull_client.py` | логика забора/шва сегментов (Stitcher, CSRF, list/get/delete) |
-| `wf_recorder.spec` | спецификация PyInstaller (bundle + `wf_recorder.exe`) |
+| `_version.py` | единственный источник версии (`__version__`) — имя exe и показ в окне |
+| `wf_recorder.spec` | спецификация PyInstaller (bundle + `wf-recorder-v<версия>.exe`) |
 | `wf_recorder.bat` | лаунчер (UTF-8, `python`/`py -3`) |
 | `tools/board_snapshot.py` | снимок состояния платы (список/размеры сегментов) для сверки баланса |
 | `tools/balance_check.py` | сверка «что было на плате → что легло в файл шва» по снимкам до/после |

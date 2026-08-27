@@ -1,4 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+# #WF-1/#WF-2: имя exe = wf-recorder-v<версия> (версия из единого _version.py).
+import os
+import importlib.util as _il
+_s = _il.spec_from_file_location("_version", os.path.join(SPECPATH, "_version.py"))
+_v = _il.module_from_spec(_s)
+_s.loader.exec_module(_v)
+_EXE_NAME = "wf-recorder-v" + _v.__version__
 
 
 a = Analysis(
@@ -6,7 +13,7 @@ a = Analysis(
     pathex=['.'],
     binaries=[],
     datas=[],
-    hiddenimports=['wf_pull_client'],
+    hiddenimports=['wf_pull_client', '_version'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='wf_recorder',
+    name=_EXE_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

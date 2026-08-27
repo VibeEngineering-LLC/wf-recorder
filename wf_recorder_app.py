@@ -40,6 +40,13 @@ import wf_pull_client as wpc  # noqa: E402  (Stitcher, get_csrf, list_segments, 
 DEF_HOST = "http://atomspectra.local"
 DEF_INTERVAL = 60
 
+# --- идентичность сборки (#WF-1, норма Д-6): версия видна в имени exe и в окне ---
+try:
+    from _version import __version__ as VERSION
+except Exception:
+    VERSION = "0.0.0"
+VERSION_LINE = "wf-recorder v" + VERSION
+
 
 class RecorderCore:
     """Фоновый поток опроса. UI читает события из self.events (queue)."""
@@ -198,7 +205,7 @@ class RecorderCore:
 class RecorderUI:
     def __init__(self, root, args):
         self.root = root
-        root.title("AtomSpectra — запись спектрограммы (#REC-12)")
+        root.title(VERSION_LINE + " — запись спектрограммы AtomSpectra")
         root.minsize(640, 420)
 
         frm = ttk.Frame(root, padding=8)
@@ -242,6 +249,14 @@ class RecorderUI:
         self.log = scrolledtext.ScrolledText(frm, height=14, state="disabled",
                                              font=("Consolas", 9))
         self.log.pack(fill="both", expand=True)
+
+        # --- версия на экране (#WF-3): видна в окне, клик → «О программе» ---
+        ver = ttk.Label(frm, text=VERSION_LINE, foreground="gray", cursor="hand2")
+        ver.pack(anchor="e", pady=(2, 0))
+        ver.bind("<Button-1>", lambda e: messagebox.showinfo(
+            "О программе",
+            "wf-recorder — рекордер спектрограммы AtomSpectra\n\n"
+            "Версия: " + VERSION + "\n\nMIT © VibeEngineering LLC"))
 
         self.core = None
         self.root.after(300, self.tick)
@@ -398,7 +413,8 @@ def _default_output_path():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Рекордер спектрограмм AtomSpectra (#REC-12)")
+    ap = argparse.ArgumentParser(description=VERSION_LINE + " — рекордер спектрограмм AtomSpectra")
+    ap.add_argument("--version", action="version", version=VERSION_LINE)
     default_out = _default_output_path()
     ap.add_argument("--host", default=DEF_HOST)
     ap.add_argument("--stitch", default=default_out)
