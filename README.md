@@ -47,7 +47,7 @@ python wf_recorder_app.py --host http://<IP-платы> --interval 60
 ## Версия
 
 Единственный источник версии — [`_version.py`](_version.py) (`__version__`). Она видна в
-трёх местах: **имя файла** (`wf-recorder-v0.4.0.exe`), флаг **`--version`** и **в окне**
+трёх местах: **имя файла** (`wf-recorder-v<версия>.exe`), флаг **`--version`** и **в окне**
 программы (серая строка внизу; клик по ней — «О программе»). При сборке имя exe берёт версию
 из `_version.py`, так что две сборки разных версий нельзя спутать (issue #2).
 
@@ -56,7 +56,7 @@ python wf_recorder_app.py --host http://<IP-платы> --interval 60
 ```bat
 pip install pyinstaller
 pyinstaller wf_recorder.spec
-:: результат: dist\wf-recorder-v0.4.0.exe (имя с версией — из _version.py)
+:: результат: dist\wf-recorder-v<версия>.exe (имя с версией — из _version.py)
 ```
 
 ## Если в журнале «разрыв в нумерации сегментов»
